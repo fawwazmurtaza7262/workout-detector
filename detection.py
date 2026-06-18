@@ -1,80 +1,59 @@
+import os
+import time
+import urllib.request
+ 
 import cv2
+import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision
 
-# --- Setup ---
-mp_pose = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-mp_drawing_styles = mp.solutions.drawing_styles
-
+# --- Model setup ---
+MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
+MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 cap = cv2.VideoCapture(0)
 
-# Key landmark indices
-KEYPOINTS = {
-    "Nose": 0,
-    "L Shoulder": 11, "R Shoulder": 12,
-    "L Elbow": 13,    "R Elbow": 14,
-    "L Wrist": 15,    "R Wrist": 16,
-    "L Hip": 23,      "R Hip": 24,
-    "L Knee": 25,     "R Knee": 26,
-    "L Ankle": 27,    "R Ankle": 28,
-}
+UP_ANGLE = 160
+DOWN_ANGLE = 110
+GOOD_ANGLE_DEPTH = 100
+BACK_LEAN_ANGLE = 45
 
-print("Pose Detection running. Press 'q' to quit.")
+VALGUS_RATIO = 0.7      
+FEEDBACK_FRAMES = 45    
+VISIBILITY_THRESH = 0.3
 
-with mp_pose.Pose(
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5,
-    model_complexity=1,
-) as pose:
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
+LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
+LEFT_ELBOW, RIGHT_ELBOW = 13, 14
+LEFT_WRIST, RIGHT_WRIST = 15, 16
+LEFT_HIP, RIGHT_HIP = 23, 24
+LEFT_KNEE, RIGHT_KNEE = 25, 26
+LEFT_ANKLE, RIGHT_ANKLE = 27, 28
 
-        h, w = frame.shape[:2]
+POSE_CONNECTIONS = [
+    (LEFT_SHOULDER, RIGHT_SHOULDER),
+    (LEFT_SHOULDER, LEFT_HIP), (RIGHT_SHOULDER, RIGHT_HIP),
+    (LEFT_HIP, RIGHT_HIP),
+    (LEFT_HIP, LEFT_KNEE), (RIGHT_HIP, RIGHT_KNEE),
+    (LEFT_KNEE, LEFT_ANKLE), (RIGHT_KNEE, RIGHT_ANKLE),
+    (LEFT_SHOULDER, LEFT_ELBOW), (RIGHT_SHOULDER, RIGHT_ELBOW),
+    (LEFT_ELBOW, LEFT_WRIST), (RIGHT_ELBOW, RIGHT_WRIST),
+]
 
-        # MediaPipe expects RGB
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rgb.flags.writeable = False
-        results = pose.process(rgb)
-        rgb.flags.writeable = True
+def ensure_model():
+    if not os.path.exists(MODEL_PATH):
+        print("Downloading model...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("Model downloaded.")
+        
+def calculate_angle(a, b, c):
+    a, b, c = np.array(a), np.array(b), np.array(c)
+    radians = np.arctan2(c[1] - b[1], c[0] - b[0]) - np.arctan2(a[1] - b[1], a[0] - b[0])
+    angle = np.abs(radians * 180.0 / np.pi)
+    return 360 - angle if angle > 180 else angle
 
-        display = frame.copy()
 
-        if results.pose_landmarks:
-            # Draw skeleton
-            mp_drawing.draw_landmarks(
-                display,
-                results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS,
-                landmark_drawing_spec=mp_drawing_styles.get_default_pose_landmarks_style(),
-            )
 
-            lm = results.pose_landmarks.landmark
-
-            # --- Visibility overlay (top-left panel) ---
-            panel_h = len(KEYPOINTS) * 18 + 10
-            cv2.rectangle(display, (0, 0), (160, panel_h), (0, 0, 0), -1)
-            for i, (name, idx) in enumerate(KEYPOINTS.items()):
-                vis = lm[idx].visibility
-                color = (0, 255, 0) if vis > 0.6 else (0, 165, 255) if vis > 0.3 else (0, 0, 255)
-                cv2.putText(display, f"{name}: {vis:.2f}", (5, 15 + i * 18),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.42, color, 1)
-
-            # --- Status banner ---
-            cv2.rectangle(display, (0, h - 30), (w, h), (0, 0, 0), -1)
-            cv2.putText(display, "POSE DETECTED", (10, h - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        else:
-            cv2.rectangle(display, (0, h - 30), (w, h), (0, 0, 0), -1)
-            cv2.putText(display, "No Person Detected", (10, h - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-
-        cv2.imshow("Pose Detection", display)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
 
 cap.release()
 cv2.destroyAllWindows()
