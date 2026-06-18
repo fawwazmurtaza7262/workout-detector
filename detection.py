@@ -52,6 +52,25 @@ def calculate_angle(a, b, c):
     angle = np.abs(radians * 180.0 / np.pi)
     return 360 - angle if angle > 180 else angle
 
+def to_xy(lm):
+    return [lm.x, lm.y]
+
+def draw_skeleton(image, landmarks, w, h):
+    for a_idx , b_idx in POSE_CONNECTIONS:
+        a, b = landmarks[a_idx], landmarks[b_idx]
+        if a.visibility < VISIBILITY_THRESH or b.visibility < VISIBILITY_THRESH:
+            continue
+        pa = (int(a.x * w), int(a.y * h))
+        pb = (int(b.x * w), int(b.y * h))
+        cv2.line(image, pa, pb, (245, 117, 66), 2)
+        
+    for idx in set(i for pair in POSE_CONNECTIONS for i in pair):
+        lm = landmarks[idx]
+        if lm.visibility < VISIBILITY_THRESH:
+            continue
+        cv2.circle(image, (int(lm.x * w), int(lm.y * h)), 5, (245, 66, 230), -1)
+        
+
 
 
 
