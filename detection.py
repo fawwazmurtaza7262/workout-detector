@@ -69,6 +69,24 @@ def draw_skeleton(image, landmarks, w, h):
         if lm.visibility < VISIBILITY_THRESH:
             continue
         cv2.circle(image, (int(lm.x * w), int(lm.y * h)), 5, (245, 66, 230), -1)
+
+def main():
+    ensure_model()
+    
+    base_options = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+    options = vision.PoseLandmarkerOptions(
+        base_options=base_options,
+        running_mode=vision.RunningMode.VIDEO,
+        num_poses=1,
+        min_pose_detection_confidence=0.5,
+        min_pose_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    landmarker = vision.PoseLandmarker.create_from_options(options)
+ 
+    cap = cv2.VideoCapture(0)
+ 
+    cv2.namedWindow('Squat Form Checker', cv2.WINDOW_NORMAL)
         
 
 
