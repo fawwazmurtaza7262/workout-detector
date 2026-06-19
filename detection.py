@@ -87,6 +87,27 @@ def main():
     cap = cv2.VideoCapture(0)
  
     cv2.namedWindow('Squat Form Checker', cv2.WINDOW_NORMAL)
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        h, w = frame.shape
+        
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        mp_image = mp_python.Image(image_format=mp_python.ImageFormat.SRGB, data=rgb_frame)
+        
+        timestamp_ms = int((time.time() - start_time)* 1000)
+        if timestamp_ms <= last_timestamp_ms:
+            timestamp_ms = last_timestamp_ms + 1
+        last_timestamp_ms = timestamp_ms
+        
+        results = landmarker.detect_for_video(mp_image, timestamp_ms)
+        
+        image = frame
+        live_warnings = []
+        
         
 
 
