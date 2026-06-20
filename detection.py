@@ -108,6 +108,24 @@ def main():
         image = frame
         live_warnings = []
         
+        if result.pose_landmark:
+            lm = result.pose_landmark[0]
+            
+            hip_L, knee_L, ankle_L = to_xy(lm[LEFT_HIP]), to_xy(lm[LEFT_KNEE]), to_xy(lm[LEFT_ANKLE])
+            hip_R, knee_R, ankle_R = to_xy(lm[RIGHT_HIP]), to_xy(lm[RIGHT_KNEE]), to_xy(lm[RIGHT_ANKLE])
+            shoulder_L = to_xy(lm[LEFT_SHOULDER])
+            
+            knee_angle_L = calculate_angle(hip_L, knee_L, ankle_L)
+            knee_angle_R = calculate_angle(hip_R, knee_R, ankle_R)
+            knee_angle = (knee_angle_L + knee_angle_R) / 2
+            
+            back_angle = calculate_angle(shoulder_L, hip_L, knee_L)
+            
+            if stage == "up" and knee_angle < DOWN_ANGLE:
+                stage = "down"
+                min_knee_angle_this_rep = knee_angle
+            
+        
         
 
 
