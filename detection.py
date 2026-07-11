@@ -31,16 +31,25 @@ from mediapipe.tasks.python import vision
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 
-# Thresholds (tune for your camera angle / body proportions)
-UP_ANGLE = 160          # knee angle considered "standing"
-DOWN_ANGLE = 110        # knee angle considered "in the squat"
-GOOD_DEPTH_ANGLE = 100  # min knee angle must drop below this to count as deep enough
-BACK_LEAN_ANGLE = 45    # torso angle (shoulder-hip-knee) below this = too rounded/leaned
-VALGUS_RATIO = 0.7      # knee-distance / ankle-distance below this = knees caving in
-FEEDBACK_FRAMES = 45    # how long to show end-of-rep feedback (~1.5s at 30fps)
+#--- Squat thresholds ---
+UP_ANGLE = 160
+DOWN_ANGLE = 110
+GOOD_DEPTH_ANGLE = 100
+BACK_LEAN_ANGLE = 45
+VALGUS_RATIO = 0.7
+ 
+# --- Curl thresholds ---
+EXTENDED_ANGLE = 160
+CURLED_ANGLE = 50
+GOOD_EXTENSION_ANGLE = 155
+GOOD_CURL_ANGLE = 60
+ELBOW_DRIFT_RATIO = 0.35
+SWING_RATIO = 0.12
+ 
+FEEDBACK_FRAMES = 45  # ~1.5s at 30fps
 VISIBILITY_THRESH = 0.3
-
-# 33-point body landmark indices
+ 
+# --- 33-point body landmark indices ---
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_ELBOW, RIGHT_ELBOW = 13, 14
 LEFT_WRIST, RIGHT_WRIST = 15, 16
