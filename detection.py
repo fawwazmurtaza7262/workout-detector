@@ -1,22 +1,30 @@
 """
-Squat Form Checker
+Combined Workout Form Checker (Squat + Bicep Curl)
 Pose estimation with MediaPipe Tasks API (PoseLandmarker) + OpenCV.
-
-- Counts reps via knee angle state machine (up <-> down)
-- Live feedback:
-    "Back too rounded"        -> torso angle too small (excessive forward lean)
-    "Knees collapsing inward" -> knees track inside the ankles (valgus)
-- End-of-rep feedback:
-    "Squat deeper"            -> bottom of rep never reached target knee angle
-    "Good rep!"                -> depth was sufficient
-
-Controls: 'r' resets rep counter, 'q' quits.
-Camera setup: side-on view works best (so the knee/hip/shoulder angle is
-meaningful). Stand ~2m from the webcam, full body in frame.
-
+ 
+Runs BOTH detectors on the same camera feed simultaneously:
+- SQUAT counter: knee angle state machine (up <-> down)
+- BICEP counter: single shared counter, increments whenever EITHER arm
+  completes a curl rep (so alternating or simultaneous curls both count)
+ 
+Live feedback:
+    Squat:
+        "Back too rounded"        -> torso angle too small (excessive forward lean)
+        "Knees collapsing inward" -> knees track inside the ankles (valgus)
+    Curl (per arm, prefixed L/R):
+        "Keep elbow pinned"       -> elbow drifting forward/away from torso
+        "Don't swing"             -> shoulder moved a lot since the rep started
+ 
+End-of-rep feedback:
+    Squat:  "Squat deeper" / "Good rep!"
+    Curl:   "Extend fully" / "Curl higher" / "Good rep!"
+ 
+Controls: 'r' resets BOTH counters, 'q' quits.
+Camera setup: side-on view works ok for squats, front-on works better for
+curls -- a 3/4 angle ~2m back is the best compromise for tracking both.
+ 
 First run downloads pose_landmarker_lite.task (~5MB) into this folder.
 """
-
 import os
 import time
 import urllib.request
@@ -101,6 +109,58 @@ def draw_skeleton(image, landmarks, w, h):
         if lm.visibility < VISIBILITY_THRESH:
             continue
         cv2.circle(image, (int(lm.x * w), int(lm.y * h)), 5, (245, 66, 230), -1)
+        
+def new_squat_squat_state():
+    return{
+        "stage": "up",
+        "min_knee_angle_this_rep": 180,
+        "counter": 0,
+        "rep_feedback": "",
+        "rep_feedback_timer": 0,
+    }
+    
+def update_squat(state, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R):
+    live_warnings = []
+    
+    if state["stage"] == "up" and knee_angle < DOWN_ANGLE:
+        state["stage"] = "down"
+        state["min_knee_angle_this_rep"] = knee_angle
+        
+    elif state["stage"] == "down":
+        state["min_knee_angle_this_rep"] = min(state["min_knee_angle_this_rep"], knee_angle)
+        
+        if knee_angle > UP_ANGLE:
+            state["stage"] = "up"
+            state["counter"] += 1
+            
+            if state["min_knee_angle_this_rep"] > GOOD_DEPTH_ANGLE:
+                state["rep_feedback"] = "Squat deeper"
+                
+            else:
+                state["rep_feedback"] = "Good rep!"
+                
+            state["rep_feedback_timer"] = FEEDBACK_FRAMES
+            state["min_knee_angle_this_rep"] = 180
+        
+        if back_angle < BACK_LEAN_ANGLE:
+            live_warnings.append("Back too rounded")
+            
+        knee_dist = abs(knee_L[0] - knee_R[0])
+        ankle_dist = abs(ankle_L[0] - ankle_R[0])
+        
+        if ankle_dist > 0.01 and (knee_dist / ankle_dist) < VALGUS_RATIO:
+            live_warnings.append("Knees collapsing inward")
+            
+        if state["rep_feedback_timer"] > 0:
+            state["rep_feedback_timer"] -= 1
+        
+        return live_warnings
+    
+    
+    
+    
+    
+
 
 
 def main():
@@ -208,7 +268,7 @@ def main():
             cv2.putText(image, rep_feedback, (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
             rep_feedback_timer -= 1
 
-        cv2.imshow('Squat Form Checker', image)
+        cv2.imshow('Workout Form Checker', image)
 
         key = cv2.waitKey(1) & 0xFF
         if key != 255:
