@@ -1,12 +1,12 @@
 """
 Combined Workout Form Checker (Squat + Bicep Curl)
 Pose estimation with MediaPipe Tasks API (PoseLandmarker) + OpenCV.
- 
+
 Runs BOTH detectors on the same camera feed simultaneously:
 - SQUAT counter: knee angle state machine (up <-> down)
 - BICEP counter: single shared counter, increments whenever EITHER arm
   completes a curl rep (so alternating or simultaneous curls both count)
- 
+
 Live feedback:
     Squat:
         "Back too rounded"        -> torso angle too small (excessive forward lean)
@@ -14,17 +14,18 @@ Live feedback:
     Curl (per arm, prefixed L/R):
         "Keep elbow pinned"       -> elbow drifting forward/away from torso
         "Don't swing"             -> shoulder moved a lot since the rep started
- 
+
 End-of-rep feedback:
     Squat:  "Squat deeper" / "Good rep!"
     Curl:   "Extend fully" / "Curl higher" / "Good rep!"
- 
+
 Controls: 'r' resets BOTH counters, 'q' quits.
 Camera setup: side-on view works ok for squats, front-on works better for
 curls -- a 3/4 angle ~2m back is the best compromise for tracking both.
- 
+
 First run downloads pose_landmarker_lite.task (~5MB) into this folder.
 """
+
 import os
 import time
 import urllib.request
@@ -35,17 +36,17 @@ import mediapipe as mp
 from mediapipe.tasks import python as mp_python
 from mediapipe.tasks.python import vision
 
-# Model setup 
+# --- Model setup ---
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
 
-#--- Squat thresholds ---
+# --- Squat thresholds ---
 UP_ANGLE = 160
 DOWN_ANGLE = 110
 GOOD_DEPTH_ANGLE = 100
 BACK_LEAN_ANGLE = 45
 VALGUS_RATIO = 0.7
- 
+
 # --- Curl thresholds ---
 EXTENDED_ANGLE = 160
 CURLED_ANGLE = 50
@@ -53,10 +54,10 @@ GOOD_EXTENSION_ANGLE = 155
 GOOD_CURL_ANGLE = 60
 ELBOW_DRIFT_RATIO = 0.35
 SWING_RATIO = 0.12
- 
+
 FEEDBACK_FRAMES = 45  # ~1.5s at 30fps
 VISIBILITY_THRESH = 0.3
- 
+
 # --- 33-point body landmark indices ---
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
 LEFT_ELBOW, RIGHT_ELBOW = 13, 14
@@ -95,6 +96,10 @@ def to_xy(lm):
     return [lm.x, lm.y]
 
 
+def dist(p, q):
+    return float(np.hypot(p[0] - q[0], p[1] - q[1]))
+
+
 def draw_skeleton(image, landmarks, w, h):
     for a_idx, b_idx in POSE_CONNECTIONS:
         a, b = landmarks[a_idx], landmarks[b_idx]
@@ -109,58 +114,106 @@ def draw_skeleton(image, landmarks, w, h):
         if lm.visibility < VISIBILITY_THRESH:
             continue
         cv2.circle(image, (int(lm.x * w), int(lm.y * h)), 5, (245, 66, 230), -1)
-        
-def new_squat_squat_state():
-    return{
+
+
+# ---------------- Squat state ----------------
+def new_squat_state():
+    return {
         "stage": "up",
         "min_knee_angle_this_rep": 180,
         "counter": 0,
         "rep_feedback": "",
         "rep_feedback_timer": 0,
     }
-    
+
+
 def update_squat(state, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R):
     live_warnings = []
-    
+
     if state["stage"] == "up" and knee_angle < DOWN_ANGLE:
         state["stage"] = "down"
         state["min_knee_angle_this_rep"] = knee_angle
-        
+
     elif state["stage"] == "down":
         state["min_knee_angle_this_rep"] = min(state["min_knee_angle_this_rep"], knee_angle)
-        
         if knee_angle > UP_ANGLE:
             state["stage"] = "up"
             state["counter"] += 1
-            
             if state["min_knee_angle_this_rep"] > GOOD_DEPTH_ANGLE:
                 state["rep_feedback"] = "Squat deeper"
-                
             else:
                 state["rep_feedback"] = "Good rep!"
-                
             state["rep_feedback_timer"] = FEEDBACK_FRAMES
             state["min_knee_angle_this_rep"] = 180
-        
-        if back_angle < BACK_LEAN_ANGLE:
-            live_warnings.append("Back too rounded")
-            
-        knee_dist = abs(knee_L[0] - knee_R[0])
-        ankle_dist = abs(ankle_L[0] - ankle_R[0])
-        
-        if ankle_dist > 0.01 and (knee_dist / ankle_dist) < VALGUS_RATIO:
-            live_warnings.append("Knees collapsing inward")
-            
-        if state["rep_feedback_timer"] > 0:
-            state["rep_feedback_timer"] -= 1
-        
-        return live_warnings
-    
-    
-    
-    
-    
 
+    if back_angle < BACK_LEAN_ANGLE:
+        live_warnings.append("Back too rounded")
+
+    knee_dist = abs(knee_L[0] - knee_R[0])
+    ankle_dist = abs(ankle_L[0] - ankle_R[0])
+    if ankle_dist > 0.01 and (knee_dist / ankle_dist) < VALGUS_RATIO:
+        live_warnings.append("Knees collapsing inward")
+
+    if state["rep_feedback_timer"] > 0:
+        state["rep_feedback_timer"] -= 1
+
+    return live_warnings
+
+
+# ---------------- Curl state ----------------
+def new_arm_state():
+    return {
+        "stage": "down",
+        "min_angle_this_rep": 180,
+        "max_angle_this_rep": 0,
+        "rep_feedback": "",
+        "rep_feedback_timer": 0,
+        "swing_baseline": None,
+    }
+
+
+def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_counter_ref):
+    """bicep_counter_ref is a single-element list acting as a shared mutable int
+    so either arm can increment the ONE shared bicep counter."""
+    live_warnings = []
+
+    if state["stage"] == "down" and elbow_angle < CURLED_ANGLE + 30:
+        state["stage"] = "up"
+        state["min_angle_this_rep"] = elbow_angle
+        state["max_angle_this_rep"] = elbow_angle
+        state["swing_baseline"] = shoulder_xy
+
+    elif state["stage"] == "up":
+        state["min_angle_this_rep"] = min(state["min_angle_this_rep"], elbow_angle)
+        state["max_angle_this_rep"] = max(state["max_angle_this_rep"], elbow_angle)
+
+        if state["swing_baseline"] is not None and torso_width > 0.01:
+            swing = dist(shoulder_xy, state["swing_baseline"]) / torso_width
+            if swing > SWING_RATIO:
+                live_warnings.append("Don't swing")
+
+        if elbow_angle > EXTENDED_ANGLE:
+            state["stage"] = "down"
+            bicep_counter_ref[0] += 1  # shared counter, either arm increments it
+
+            if state["min_angle_this_rep"] > GOOD_CURL_ANGLE:
+                state["rep_feedback"] = "Curl higher"
+            elif state["max_angle_this_rep"] < GOOD_EXTENSION_ANGLE:
+                state["rep_feedback"] = "Extend fully"
+            else:
+                state["rep_feedback"] = "Good rep!"
+            state["rep_feedback_timer"] = FEEDBACK_FRAMES
+            state["swing_baseline"] = None
+
+    if torso_width > 0.01:
+        elbow_drift = abs(elbow_xy[0] - shoulder_xy[0]) / torso_width
+        if elbow_drift > ELBOW_DRIFT_RATIO:
+            live_warnings.append("Keep elbow pinned")
+
+    if state["rep_feedback_timer"] > 0:
+        state["rep_feedback_timer"] -= 1
+
+    return live_warnings
 
 
 def main():
@@ -178,15 +231,12 @@ def main():
     landmarker = vision.PoseLandmarker.create_from_options(options)
 
     cap = cv2.VideoCapture(0)
+    cv2.namedWindow('Workout Form Checker', cv2.WINDOW_NORMAL)
 
-    cv2.namedWindow('Squat Form Checker', cv2.WINDOW_NORMAL)
-
-    counter = 0
-    stage = "up"
-    min_knee_angle_this_rep = 180
-
-    rep_feedback = ""
-    rep_feedback_timer = 0
+    squat = new_squat_state()
+    left_arm = new_arm_state()
+    right_arm = new_arm_state()
+    bicep_counter = [0]  # shared mutable counter, incremented by either arm
 
     start_time = time.time()
     last_timestamp_ms = -1
@@ -208,75 +258,67 @@ def main():
         result = landmarker.detect_for_video(mp_image, timestamp_ms)
 
         image = frame
-        live_warnings = []
+        all_warnings = []
 
         if result.pose_landmarks:
             lm = result.pose_landmarks[0]
 
-            hip_L, knee_L, ankle_L = to_xy(lm[LEFT_HIP]), to_xy(lm[LEFT_KNEE]), to_xy(lm[LEFT_ANKLE])
-            hip_R, knee_R, ankle_R = to_xy(lm[RIGHT_HIP]), to_xy(lm[RIGHT_KNEE]), to_xy(lm[RIGHT_ANKLE])
-            shoulder_L = to_xy(lm[LEFT_SHOULDER])
+            shoulder_L, elbow_L, wrist_L = to_xy(lm[LEFT_SHOULDER]), to_xy(lm[LEFT_ELBOW]), to_xy(lm[LEFT_WRIST])
+            shoulder_R, elbow_R, wrist_R = to_xy(lm[RIGHT_SHOULDER]), to_xy(lm[RIGHT_ELBOW]), to_xy(lm[RIGHT_WRIST])
+            hip_L, hip_R = to_xy(lm[LEFT_HIP]), to_xy(lm[RIGHT_HIP])
+            knee_L, knee_R = to_xy(lm[LEFT_KNEE]), to_xy(lm[RIGHT_KNEE])
+            ankle_L, ankle_R = to_xy(lm[LEFT_ANKLE]), to_xy(lm[RIGHT_ANKLE])
 
-            # Average knee angle (both legs) for rep tracking
+            torso_width = dist(shoulder_L, shoulder_R) or dist(shoulder_L, hip_L)
+
+            # --- Curl angles/updates ---
+            angle_L = calculate_angle(shoulder_L, elbow_L, wrist_L)
+            angle_R = calculate_angle(shoulder_R, elbow_R, wrist_R)
+            warn_curl_L = update_arm(left_arm, angle_L, shoulder_L, elbow_L, torso_width, bicep_counter)
+            warn_curl_R = update_arm(right_arm, angle_R, shoulder_R, elbow_R, torso_width, bicep_counter)
+
+            # --- Squat angles/updates ---
             knee_angle_L = calculate_angle(hip_L, knee_L, ankle_L)
             knee_angle_R = calculate_angle(hip_R, knee_R, ankle_R)
             knee_angle = (knee_angle_L + knee_angle_R) / 2
-
-            # Torso/back angle (left side, since side-on camera is assumed)
             back_angle = calculate_angle(shoulder_L, hip_L, knee_L)
+            warn_squat = update_squat(squat, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R)
 
-            # Rep counting state machine 
-            if stage == "up" and knee_angle < DOWN_ANGLE:
-                stage = "down"
-                min_knee_angle_this_rep = knee_angle
-
-            elif stage == "down":
-                min_knee_angle_this_rep = min(min_knee_angle_this_rep, knee_angle)
-                if knee_angle > UP_ANGLE:
-                    stage = "up"
-                    counter += 1
-                    if min_knee_angle_this_rep > GOOD_DEPTH_ANGLE:
-                        rep_feedback = "Squat deeper"
-                    else:
-                        rep_feedback = "Good rep!"
-                    rep_feedback_timer = FEEDBACK_FRAMES
-                    min_knee_angle_this_rep = 180
-
-            # --- Live form checks ---
-            if back_angle < BACK_LEAN_ANGLE:
-                live_warnings.append("Back too rounded")
-
-            knee_dist = abs(knee_L[0] - knee_R[0])
-            ankle_dist = abs(ankle_L[0] - ankle_R[0])
-            if ankle_dist > 0.01 and (knee_dist / ankle_dist) < VALGUS_RATIO:
-                live_warnings.append("Knees collapsing inward")
+            all_warnings = (
+                [f"L: {w_}" for w_ in warn_curl_L]
+                + [f"R: {w_}" for w_ in warn_curl_R]
+                + warn_squat
+            )
 
             draw_skeleton(image, lm, w, h)
 
-            # HUD text
-            cv2.putText(image, f'Knee angle: {int(knee_angle)}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(image, f'Back angle: {int(back_angle)}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            cv2.putText(image, f'Stage: {stage}', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            cv2.putText(image, f'Knee: {int(knee_angle)}  Back: {int(back_angle)}', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(image, f'L elbow: {int(angle_L)}  R elbow: {int(angle_R)}', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            cv2.putText(image, f'Squat stage: {squat["stage"]}  L: {left_arm["stage"]}  R: {right_arm["stage"]}', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        cv2.putText(image, f'REPS: {counter}', (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 3)
+        # --- Counters (always shown) ---
+        cv2.putText(image, f'SQUATS: {squat["counter"]}', (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 3)
+        cv2.putText(image, f'CURLS: {bicep_counter[0]}', (10, 175), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 3)
 
-        for i, warn in enumerate(live_warnings):
+        for i, warn in enumerate(all_warnings):
             cv2.putText(image, warn, (10, 430 - i * 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        if rep_feedback_timer > 0:
-            color = (0, 255, 0) if rep_feedback == "Good rep!" else (0, 255, 255)
-            cv2.putText(image, rep_feedback, (10, 460), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
-            rep_feedback_timer -= 1
+        y_off = 0
+        for label, state in (("Squat", squat), ("L curl", left_arm), ("R curl", right_arm)):
+            if state["rep_feedback_timer"] > 0:
+                color = (0, 255, 0) if state["rep_feedback"] == "Good rep!" else (0, 255, 255)
+                cv2.putText(image, f'{label}: {state["rep_feedback"]}', (10, 460 + y_off),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                y_off += 28
 
         cv2.imshow('Workout Form Checker', image)
 
         key = cv2.waitKey(1) & 0xFF
-        if key != 255:
-            print(f"key pressed: {key}")
         if key == ord('q'):
             break
         elif key == ord('r'):
-            counter = 0
+            squat["counter"] = 0
+            bicep_counter[0] = 0
 
     landmarker.close()
     cap.release()
