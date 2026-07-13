@@ -14,9 +14,10 @@ Each completed rep, across both exercises, records:
     - tempo (seconds spent in the "down"/working phase of that rep)
     - feedback tag ("Good rep!", "Squat deeper", "Don't swing", etc.)
 
-On quit ('q'), a session summary is written to ./session_logs/ as both
-.json (full rep-by-rep log) and .csv (flat table), plus a printed
-one-line-per-exercise summary in the terminal.
+On quit ('q'), the full rep-by-rep log is printed to the terminal as CSV,
+followed by a one-line-per-exercise summary. Redirect stdout if you want
+it saved to a file, e.g.:
+    python combined_form_checker.py > session.csv
 
 Live feedback:
     Squat:
@@ -43,8 +44,8 @@ First run downloads pose_landmarker_lite.task (~5MB) into this folder.
 """
 
 import csv
-import json
 import os
+import sys
 import time
 import urllib.request
 from collections import deque
@@ -59,7 +60,6 @@ from mediapipe.tasks.python import vision
 # --- Model setup ---
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
-LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_logs")
 
 # --- Squat thresholds ---
 UP_ANGLE = 160
@@ -167,25 +167,19 @@ class SessionLog:
         return out
 
     def save(self):
+        """Print the rep log as CSV directly to the terminal instead of
+        writing a file — pipe/redirect stdout if you want it saved,
+        e.g. `python combined_form_checker.py > session.csv`."""
         if not self.reps:
-            print("No reps recorded, nothing to save.")
+            print("No reps recorded.")
             return
-        os.makedirs(LOG_DIR, exist_ok=True)
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        json_path = os.path.join(LOG_DIR, f"session_{stamp}.json")
-        with open(json_path, "w") as f:
-            json.dump({"reps": self.reps, "summary": self.summary()}, f, indent=2)
+        print("\n--- Session log (CSV) ---")
+        writer = csv.DictWriter(sys.stdout, fieldnames=["exercise", "timestamp", "tempo_s", "feedback"])
+        writer.writeheader()
+        writer.writerows(self.reps)
 
-        csv_path = os.path.join(LOG_DIR, f"session_{stamp}.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["exercise", "timestamp", "tempo_s", "feedback"])
-            writer.writeheader()
-            writer.writerows(self.reps)
-
-        print(f"\nSession saved -> {json_path}")
-        print(f"Session saved -> {csv_path}\n")
-        print("--- Session summary ---")
+        print("\n--- Session summary ---")
         for ex, stats in self.summary().items():
             pct = 100 * stats["good"] / stats["total"] if stats["total"] else 0
             top_fault = max(stats["faults"], key=stats["faults"].get) if stats["faults"] else "none"
