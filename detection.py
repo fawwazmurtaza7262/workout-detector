@@ -4,8 +4,19 @@ Pose estimation with MediaPipe Tasks API (PoseLandmarker) + OpenCV.
 
 Runs BOTH detectors on the same camera feed simultaneously:
 - SQUAT counter: knee angle state machine (up <-> down)
-- BICEP counter: single shared counter, increments whenever EITHER arm
-  completes a curl rep (so alternating or simultaneous curls both count)
+- CURL counter:  single shared counter, increments whenever EITHER arm
+                 completes a curl rep (so alternating or simultaneous
+                 curls both count)
+
+Each completed rep, across both exercises, records:
+    - exercise name
+    - timestamp
+    - tempo (seconds spent in the "down"/working phase of that rep)
+    - feedback tag ("Good rep!", "Squat deeper", "Don't swing", etc.)
+
+On quit ('q'), a session summary is written to ./session_logs/ as both
+.json (full rep-by-rep log) and .csv (flat table), plus a printed
+one-line-per-exercise summary in the terminal.
 
 Live feedback:
     Squat:
@@ -19,16 +30,25 @@ End-of-rep feedback:
     Squat:  "Squat deeper" / "Good rep!"
     Curl:   "Extend fully" / "Curl higher" / "Good rep!"
 
-Controls: 'r' resets BOTH counters, 'q' quits.
+On-screen rep history: last 5 reps (any exercise) shown bottom-right
+with exercise name + feedback tag, most recent last.
+
+Controls: 'r' resets ALL counters + history (does not touch the log),
+'q' quits and writes the session summary.
+
 Camera setup: side-on view works ok for squats, front-on works better for
 curls -- a 3/4 angle ~2m back is the best compromise for tracking both.
 
 First run downloads pose_landmarker_lite.task (~5MB) into this folder.
 """
 
+import csv
+import json
 import os
 import time
 import urllib.request
+from collections import deque
+from datetime import datetime
 
 import cv2
 import numpy as np
@@ -39,6 +59,7 @@ from mediapipe.tasks.python import vision
 # --- Model setup ---
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pose_landmarker_lite.task")
 MODEL_URL = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task"
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "session_logs")
 
 # --- Squat thresholds ---
 UP_ANGLE = 160
@@ -57,6 +78,7 @@ SWING_RATIO = 0.12
 
 FEEDBACK_FRAMES = 45  # ~1.5s at 30fps
 VISIBILITY_THRESH = 0.3
+HISTORY_LEN = 5
 
 # --- 33-point body landmark indices ---
 LEFT_SHOULDER, RIGHT_SHOULDER = 11, 12
@@ -116,6 +138,60 @@ def draw_skeleton(image, landmarks, w, h):
         cv2.circle(image, (int(lm.x * w), int(lm.y * h)), 5, (245, 66, 230), -1)
 
 
+# ---------------- Session log ----------------
+class SessionLog:
+    """Collects every completed rep across all exercises for export."""
+
+    def __init__(self):
+        self.reps = []  # list of dicts: exercise, timestamp, tempo_s, feedback
+
+    def record(self, exercise, tempo_s, feedback):
+        self.reps.append({
+            "exercise": exercise,
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "tempo_s": round(tempo_s, 2),
+            "feedback": feedback,
+        })
+
+    def summary(self):
+        """Per-exercise: total reps, good-rep %, most common fault."""
+        out = {}
+        for r in self.reps:
+            ex = r["exercise"]
+            out.setdefault(ex, {"total": 0, "good": 0, "faults": {}})
+            out[ex]["total"] += 1
+            if r["feedback"] == "Good rep!":
+                out[ex]["good"] += 1
+            else:
+                out[ex]["faults"][r["feedback"]] = out[ex]["faults"].get(r["feedback"], 0) + 1
+        return out
+
+    def save(self):
+        if not self.reps:
+            print("No reps recorded, nothing to save.")
+            return
+        os.makedirs(LOG_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        json_path = os.path.join(LOG_DIR, f"session_{stamp}.json")
+        with open(json_path, "w") as f:
+            json.dump({"reps": self.reps, "summary": self.summary()}, f, indent=2)
+
+        csv_path = os.path.join(LOG_DIR, f"session_{stamp}.csv")
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["exercise", "timestamp", "tempo_s", "feedback"])
+            writer.writeheader()
+            writer.writerows(self.reps)
+
+        print(f"\nSession saved -> {json_path}")
+        print(f"Session saved -> {csv_path}\n")
+        print("--- Session summary ---")
+        for ex, stats in self.summary().items():
+            pct = 100 * stats["good"] / stats["total"] if stats["total"] else 0
+            top_fault = max(stats["faults"], key=stats["faults"].get) if stats["faults"] else "none"
+            print(f"{ex}: {stats['total']} reps, {pct:.0f}% good, most common fault: {top_fault}")
+
+
 # ---------------- Squat state ----------------
 def new_squat_state():
     return {
@@ -124,27 +200,31 @@ def new_squat_state():
         "counter": 0,
         "rep_feedback": "",
         "rep_feedback_timer": 0,
+        "rep_start_time": None,
     }
 
 
-def update_squat(state, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R):
+def update_squat(state, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R, log):
     live_warnings = []
 
     if state["stage"] == "up" and knee_angle < DOWN_ANGLE:
         state["stage"] = "down"
         state["min_knee_angle_this_rep"] = knee_angle
+        state["rep_start_time"] = time.time()
 
     elif state["stage"] == "down":
         state["min_knee_angle_this_rep"] = min(state["min_knee_angle_this_rep"], knee_angle)
         if knee_angle > UP_ANGLE:
             state["stage"] = "up"
             state["counter"] += 1
+            tempo = time.time() - state["rep_start_time"] if state["rep_start_time"] else 0.0
             if state["min_knee_angle_this_rep"] > GOOD_DEPTH_ANGLE:
                 state["rep_feedback"] = "Squat deeper"
             else:
                 state["rep_feedback"] = "Good rep!"
             state["rep_feedback_timer"] = FEEDBACK_FRAMES
             state["min_knee_angle_this_rep"] = 180
+            log.record("Squat", tempo, state["rep_feedback"])
 
     if back_angle < BACK_LEAN_ANGLE:
         live_warnings.append("Back too rounded")
@@ -169,12 +249,13 @@ def new_arm_state():
         "rep_feedback": "",
         "rep_feedback_timer": 0,
         "swing_baseline": None,
+        "rep_start_time": None,
     }
 
 
-def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_counter_ref):
+def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_counter_ref, side_label, log):
     """bicep_counter_ref is a single-element list acting as a shared mutable int
-    so either arm can increment the ONE shared bicep counter."""
+    so either arm can increment the ONE shared curl counter."""
     live_warnings = []
 
     if state["stage"] == "down" and elbow_angle < CURLED_ANGLE + 30:
@@ -182,6 +263,7 @@ def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_cou
         state["min_angle_this_rep"] = elbow_angle
         state["max_angle_this_rep"] = elbow_angle
         state["swing_baseline"] = shoulder_xy
+        state["rep_start_time"] = time.time()
 
     elif state["stage"] == "up":
         state["min_angle_this_rep"] = min(state["min_angle_this_rep"], elbow_angle)
@@ -195,6 +277,7 @@ def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_cou
         if elbow_angle > EXTENDED_ANGLE:
             state["stage"] = "down"
             bicep_counter_ref[0] += 1  # shared counter, either arm increments it
+            tempo = time.time() - state["rep_start_time"] if state["rep_start_time"] else 0.0
 
             if state["min_angle_this_rep"] > GOOD_CURL_ANGLE:
                 state["rep_feedback"] = "Curl higher"
@@ -204,6 +287,7 @@ def update_arm(state, elbow_angle, shoulder_xy, elbow_xy, torso_width, bicep_cou
                 state["rep_feedback"] = "Good rep!"
             state["rep_feedback_timer"] = FEEDBACK_FRAMES
             state["swing_baseline"] = None
+            log.record(f"Curl ({side_label})", tempo, state["rep_feedback"])
 
     if torso_width > 0.01:
         elbow_drift = abs(elbow_xy[0] - shoulder_xy[0]) / torso_width
@@ -238,8 +322,19 @@ def main():
     right_arm = new_arm_state()
     bicep_counter = [0]  # shared mutable counter, incremented by either arm
 
+    log = SessionLog()
+    rep_history = deque(maxlen=HISTORY_LEN)  # each item: "Exercise: feedback"
+
     start_time = time.time()
     last_timestamp_ms = -1
+
+    def history_snapshot():
+        """Call after each update_* to catch newly logged reps and mirror them into rep_history."""
+        if log.reps:
+            latest = log.reps[-1]
+            tag = f'{latest["exercise"]}: {latest["feedback"]}'
+            if not rep_history or rep_history[-1] != tag:
+                rep_history.append(tag)
 
     while cap.isOpened():
         ret, frame = cap.read()
@@ -274,15 +369,18 @@ def main():
             # --- Curl angles/updates ---
             angle_L = calculate_angle(shoulder_L, elbow_L, wrist_L)
             angle_R = calculate_angle(shoulder_R, elbow_R, wrist_R)
-            warn_curl_L = update_arm(left_arm, angle_L, shoulder_L, elbow_L, torso_width, bicep_counter)
-            warn_curl_R = update_arm(right_arm, angle_R, shoulder_R, elbow_R, torso_width, bicep_counter)
+            warn_curl_L = update_arm(left_arm, angle_L, shoulder_L, elbow_L, torso_width, bicep_counter, "L", log)
+            history_snapshot()
+            warn_curl_R = update_arm(right_arm, angle_R, shoulder_R, elbow_R, torso_width, bicep_counter, "R", log)
+            history_snapshot()
 
             # --- Squat angles/updates ---
             knee_angle_L = calculate_angle(hip_L, knee_L, ankle_L)
             knee_angle_R = calculate_angle(hip_R, knee_R, ankle_R)
             knee_angle = (knee_angle_L + knee_angle_R) / 2
             back_angle = calculate_angle(shoulder_L, hip_L, knee_L)
-            warn_squat = update_squat(squat, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R)
+            warn_squat = update_squat(squat, knee_angle, back_angle, knee_L, knee_R, ankle_L, ankle_R, log)
+            history_snapshot()
 
             all_warnings = (
                 [f"L: {w_}" for w_ in warn_curl_L]
@@ -306,10 +404,16 @@ def main():
         y_off = 0
         for label, state in (("Squat", squat), ("L curl", left_arm), ("R curl", right_arm)):
             if state["rep_feedback_timer"] > 0:
-                color = (0, 255, 0) if state["rep_feedback"] == "Good rep!" else (0, 255, 255)
+                color = (0, 255, 0) if state["rep_feedback"] in ("Good rep!",) else (0, 255, 255)
                 cv2.putText(image, f'{label}: {state["rep_feedback"]}', (10, 460 + y_off),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
                 y_off += 28
+
+        # --- Rep history, bottom-right ---
+        hist_x = w - 320
+        cv2.putText(image, "Recent reps:", (hist_x, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        for i, tag in enumerate(rep_history):
+            cv2.putText(image, tag, (hist_x, 55 + i * 24), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
 
         cv2.imshow('Workout Form Checker', image)
 
@@ -319,10 +423,13 @@ def main():
         elif key == ord('r'):
             squat["counter"] = 0
             bicep_counter[0] = 0
+            rep_history.clear()
 
     landmarker.close()
     cap.release()
     cv2.destroyAllWindows()
+
+    log.save()
 
 
 if __name__ == "__main__":
